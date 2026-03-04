@@ -1,0 +1,239 @@
+---
+title: "Final Code"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+library(tidyverse)
+library(DescTools)
+library(estimatr)
+library(fastDummies)
+library(ggplot2)
+# read in the csv and choose the columns we will use
+data <- read.csv('endline.csv', header = TRUE)
+data <- data[, c("grade", "female", "age", "language", "region", "school_type", 
+                 "encrypted_school_code", "treatment", "read_comp_score", "orf")]
+
+#school_type is collinear with treatment. Have to drop it.Grouping all controls regardless of type under "control" makes this variable useless.
+data <- data %>% select(-school_type)
+
+# change the treatment variable to a binary integer
+data$treatment <- ifelse(data$treatment == "Control", 0, 1)
+
+# change school code to be 1,...,num_schools, remove original column
+data$school_id <- as.numeric(factor(data$encrypted_school_code, levels = unique(data$encrypted_school_code)))
+data <- data %>% select(-encrypted_school_code)
+
+# convert character columns to factor
+data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.factor)
+
+# remove rows with NAs
+data <- na.omit(data)
+
+# Age has a skewed distro with a massive outlier (someone aged 100). Will drop outlier as it seems like an error
+data <- data[data$age <= 60, ]
+
+# set up covariates (X), response (Y), and treatment (Z)
+X <- data[, c("grade", "female", "age", "language")]
+Z <- data$treatment
+Y <- data$read_comp_score # can also use orf (oral reading fluency)
+```
+
+# Baseline school-level analysis
+```{r baseline}
+school_level_data <- data %>% 
+  group_by(school_id) %>% 
+  summarise(
+    y = mean(read_comp_score, na.rm = TRUE),
+    z = mean(treatment, na.rm = TRUE)        
+  )
+
+y <- school_level_data$y
+z <- school_level_data$z
+
+model <- lm(y ~ z, data = school_level_data)
+model_summary_r_comp <- summary(model)
+
+print("--- Reading Comp Results ---")
+model_summary_r_comp$coefficients["z", ]
+```
+
+# School Level Data Distribution
+
+```{r school level dist}
+ggplot(school_level_data, aes(x = y, fill = as.factor(z))) +
+  geom_density(alpha = 0.5) + # alpha adds transparency
+  labs(title = "Average Reading Comprehension Density of Treatment and Control Schools",
+       x = "Average Reading Comprehension Score",
+       y = "Density",
+       fill = "Treatment") + # Customize labels
+  theme_classic() # Use a clean theme
+```
+
+# School Level Covariate Balance
+
+```{r school covariate balance}
+school_summary <- data %>%
+  group_by(school_id) %>%
+  mutate(z = Mode(treatment)) %>%
+  mutate(num_2grade = sum(grade == 2)) %>%
+  mutate(num_3grade = sum(grade == 3)) %>%
+  mutate(num_female = sum(female == "Female")) %>%
+  mutate(num_male = sum(female == "Male")) %>%
+  mutate(avg_age = mean(age)) %>%
+  mutate(sd_age = sd(age)) %>%
+  mutate(common_language = Mode(language)) %>%
+  select(-grade, -female, -age, -language, -treatment, -read_comp_score, -orf, -region) %>%
+  distinct()
+
+school_summary <- dummy_cols(school_summary, 
+                             select_columns = "common_language", 
+                             remove_first_dummy = TRUE) %>% select(-common_language)
+
+covariates <- setdiff(names(school_summary), c("school_id", "z"))
+
+balance_table <- data.frame(
+  covariate = covariates,
+  smd = sapply(covariates, function(v) {
+    x1 <- school_summary[school_summary$z == 1, v, drop = TRUE]
+    x0 <- school_summary[school_summary$z == 0, v, drop = TRUE]
+    (mean(x1, na.rm = TRUE) - mean(x0, na.rm = TRUE)) /
+      sqrt((var(x1, na.rm = TRUE) + var(x0, na.rm = TRUE))/2)
+  })
+)
+
+ggplot(balance_table, aes(x = smd, y = covariate)) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed") +
+  xlim(c(-0.2, 0.2)) + 
+  labs(
+    title = "Covariate Balance Between Treatment and Control",
+    x = "Standardized Mean Difference",
+    y = "Covariate"
+  ) +
+  theme_classic()
+```
+
+
+# Student-level analysis with Lin's estimator
+```{r lin_estimator_analysis}
+##OHE language
+X_enc <- dummy_cols(X, 
+                   select_columns = "language", 
+                   remove_first_dummy = TRUE)
+X_enc$female <- ifelse(X_enc$female =="Female",1,0)
+#keeping only covars
+X_enc <- X_enc %>% 
+  select(-language) 
+
+# Center the covariates
+X_enc_cen <- scale(X_enc, center = TRUE, scale = FALSE)
+
+X_centered <- as.data.frame(X_enc_cen)
+
+analysis_df <- data.frame(
+  read_score = Y, 
+  z = Z,                             
+  school_id = data$school_id,        
+  X_centered                         
+)
+
+#Create regression formula dynamically
+covariate_names <- colnames(X_centered)
+rhs_formula <- paste("z * (", paste(covariate_names, collapse = " + "), ")")
+
+#Model for Reading Score
+formula_read <- as.formula(paste("read_score ~", rhs_formula))
+lin_model_read <- lm_robust(formula_read, data = analysis_df,clusters =school_id)
+
+# results
+print("--- Lin's Estimator Results (Reading Score) student-level ---")
+summary(lin_model_read)
+```
+
+# Student Level Distribution
+
+```{r student distribution}
+ggplot(analysis_df, aes(x = read_score, fill = as.factor(z))) +
+  geom_bar(aes(y = after_stat(prop), group = as.factor(z)),
+           position = "dodge") +
+  labs(title = "Reading Comprehension Scores for Treatment and Control Students",
+       x = "Reading Comprehension Score",
+       y = "Proportion of Students",
+       fill = "Treatment") + 
+  scale_x_continuous(breaks = 0:5) + 
+  theme_classic()
+```
+
+
+#Causal forests analysis
+
+*Causal forests handles cross fitting and hyper parameter tuning so we only need to train the model. It also builds the propensity score and outcome models simultaneously 
+```{r causal_forest_training}
+library(grf)
+school <- data$school_id
+cf2 <- causal_forest(
+  X = X_centered, 
+  Y = Y, 
+  W = Z,
+  clusters = school, 
+  tune.parameters = "all"
+)
+```
+
+```{r causal_forest_analysis}
+print("----Results for Reading Comp----")
+ate_result_read_comp <- average_treatment_effect(cf2, target.sample = "all")
+print(ate_result_read_comp)
+blp_results <- best_linear_projection(cf2, X_centered)
+
+# 2. Extract Estimates (Column 1) and Standard Errors (Column 2)
+estimates <- blp_results[, 1]
+std_errors <- blp_results[, 2]
+
+# 3. Calculate Lower and Upper Bounds (Using 1.96 for 95% CI)
+lower_ci <- estimates - 1.96 * std_errors
+upper_ci <- estimates + 1.96 * std_errors
+
+# 4. Combine into a clean table
+results_with_ci <- cbind(blp_results, Lower_CI = lower_ci, Upper_CI = upper_ci)
+
+# View the final table
+print(results_with_ci)
+```
+```{r}
+# Compute the ATE (uses Doubly Robust / AIPW estimation by default)
+ate_result <- average_treatment_effect(cf2)
+
+# Extract estimate and standard error
+estimate <- ate_result["estimate"]
+std_error <- ate_result["std.err"]
+
+# Calculate t-value, p-value, and 95% Confidence Intervals
+t_value <- estimate / std_error
+p_value <- 2 * (1 - pnorm(abs(t_value))) # Two-sided p-value
+ci_lower <- estimate - 1.96 * std_error
+ci_upper <- estimate + 1.96 * std_error
+
+# Combine into a clean table
+ate_summary <- data.frame(
+  Estimate = estimate,
+  Std_Error = std_error,
+  t_value = t_value,
+  p_value = p_value,
+  CI_Lower_95 = ci_lower,
+  CI_Upper_95 = ci_upper
+)
+
+# Print the ATE Table
+print("--- Average Treatment Effect (ATE) Summary ---")
+print(ate_summary)
+print("--- Calibration Test Results ---")
+# This tests if the ATE is correct (mean.forest.prediction)
+# and if the heterogeneity is real (differential.forest.prediction)
+test_calibration(cf2)
+```
+*Results are similar to those found utilizing lin's estimator at the student level. 
+
